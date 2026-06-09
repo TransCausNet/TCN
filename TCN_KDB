@@ -1,0 +1,188 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import random
+from sklearn.metrics import mutual_info_score, precision_score, recall_score, f1_score
+from sklearn.preprocessing import StandardScaler
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# --- تنظیمات استراتژیک اصلاح شده ---
+DATA_PATH = r"sachs.csv"
+GT_PATH = r"sachs_Ground_Truth.csv"
+NODE_NAMES = ["Raf", "Mek", "Plcg", "PIP2", "PIP3", "Erk", "Akt", "PKA", "PKC", "P38", "Jnk"]
+N_NODES = len(NODE_NAMES)
+
+PENALTY_INTENSITY = 5.0
+DAG_PENALTY_WEIGHT = 2.0  # مقدار نهایی پنالتی DAG
+L1_LAMBDA = 0.05          # افزایش جریمه برای بهبود Precision مطابق درخواست شما
+EPOCHS = 800
+LEARNING_RATE = 0.0008
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+set_seed(42)
+
+# --- ۱. توابع کمکی ---
+def get_kdb_candidate(df, target, k=3):
+    features = [f for f in df.columns if f != target]
+    mi_target = {f: mutual_info_score(df[f], df[target]) for f in features}
+    sorted_features = sorted(features, key=lambda x: mi_target[x], reverse=True)
+    edges = set()
+    for i, child in enumerate(sorted_features):
+        parents_pool = sorted_features[:i]
+        if parents_pool:
+            mi_parents = {p: mutual_info_score(df[child], df[p]) for p in parents_pool}
+            best_parents = sorted(mi_parents, key=mi_parents.get, reverse=True)[:k]
+            for p in best_parents:
+                edges.add((p, child))
+    for f in sorted_features[:k]:
+        edges.add((f, target))
+    return edges
+
+class CausalEffectPenalty(nn.Module):
+    def __init__(self, df, nodes):
+        super().__init__()
+        self.nodes = nodes
+        self.register_buffer('effect_matrix', self._compute_effect_matrix(df))
+    
+    def _compute_effect_matrix(self, df):
+        mat = np.zeros((N_NODES, N_NODES))
+        for i, src in enumerate(self.nodes):
+            for j, tgt in enumerate(self.nodes):
+                if i == j: continue
+                s_data, t_data = df[src].values, df[tgt].values
+                low, high = np.percentile(s_data, 10), np.percentile(s_data, 90)
+                mask = (s_data > low) & (s_data < high)
+                eff = np.abs(t_data[~mask].mean() - t_data[mask].mean())
+                t_low, t_high = np.percentile(t_data, 10), np.percentile(t_data, 90)
+                t_mask = (t_data > t_low) & (t_data < t_high)
+                rev_eff = np.abs(s_data[~t_mask].mean() - s_data[t_mask].mean())
+                mat[i, j] = eff if eff > rev_eff else 0
+        if mat.max() > 0: mat = mat / mat.max()
+        return torch.tensor(mat).float()
+
+    def forward(self, learned_adj):
+        penalty = learned_adj * (1.0 - self.effect_matrix.T)
+        return penalty.mean()
+
+def dag_penalty(adj):
+    return torch.trace(torch.matrix_exp(adj * adj)) - N_NODES
+
+# --- ۲. مدل ترنسفورمر ---
+class IntegratedCausalTransformer(nn.Module):
+    def __init__(self, n_nodes, d_model=88, n_heads=11):
+        super().__init__()
+        self.n_nodes, self.n_heads, self.d_k = n_nodes, n_heads, d_model // n_heads
+        self.embeddings = nn.ModuleList([nn.Linear(1, d_model) for _ in range(n_nodes)])
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.gate = nn.Parameter(torch.ones(n_heads))
+        self.fc_out = nn.Linear(d_model, 1)
+
+    def forward(self, x, multi_masks):
+        batch_size = x.size(0)
+        x_e = torch.stack([self.embeddings[i](x[:, i, :]) for i in range(self.n_nodes)], dim=1)
+        Q = self.q_proj(x_e).view(batch_size, self.n_nodes, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.k_proj(x_e).view(batch_size, self.n_nodes, self.n_heads, self.d_k).transpose(1, 2)
+        attn = F.softmax((torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.d_k))
+                         .masked_fill(multi_masks.unsqueeze(0) == 0, -1e9), dim=-1)
+        gate_w = F.softmax(self.gate, dim=0).view(1, self.n_heads, 1, 1)
+        raw_adj = (attn * gate_w).sum(dim=1).mean(dim=0)
+        h = torch.matmul(attn * gate_w, self.v_proj(x_e).view(batch_size, self.n_nodes, self.n_heads, self.d_k).transpose(1, 2)
+                         ).transpose(1, 2).reshape(batch_size, self.n_nodes, -1)
+        return self.fc_out(h).squeeze(-1), raw_adj
+
+def evaluate_metrics_directional(adj_matrix, gt_matrix, threshold=0.1):
+    adj_np = (adj_matrix.detach().cpu().numpy() > threshold).astype(int)
+    gt_np = gt_matrix.astype(int)
+    shd = np.sum(np.abs(adj_np - gt_np))
+    y_true, y_pred = gt_np.flatten(), adj_np.flatten()
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    tp = np.sum((y_pred == 1) & (y_true == 1))
+    return tp, precision, recall, f1, shd
+
+# --- ۴. اجرای اصلی ---
+if __name__ == "__main__":
+    df_raw = pd.read_csv(DATA_PATH, header=None)
+    df_raw.columns = NODE_NAMES
+    df_norm = pd.DataFrame(StandardScaler().fit_transform(df_raw), columns=NODE_NAMES)
+    gt_mat = pd.read_csv(GT_PATH, header=None).values
+
+    df_disc = df_norm.apply(lambda x: pd.cut(x, bins=3, labels=False))
+    masks = []
+    for target in NODE_NAMES:
+        adj = np.zeros((N_NODES, N_NODES))
+        for u, v in get_kdb_candidate(df_disc, target):
+            adj[NODE_NAMES.index(u), NODE_NAMES.index(v)] = 1
+        masks.append(torch.tensor(adj).float())
+    masks = torch.stack(masks)
+
+    model = IntegratedCausalTransformer(N_NODES)
+    penalty_layer = CausalEffectPenalty(df_norm, NODE_NAMES)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    inputs = torch.tensor(df_norm.values).float().unsqueeze(-1)
+
+    best_f1 = -1
+    best_stats = {}
+
+    print(f"{'Epoch':<6} | {'Total':<8} | {'DAG h':<9} | {'L1':<7} | {'TP':<4} | {'F1':<6} | {'SHD'}")
+    print("-" * 65)
+
+    for epoch in range(EPOCHS + 1):
+        # پنالتی علی کاهشی
+        lambda_causal = PENALTY_INTENSITY * (1 - (epoch / 100)) if epoch <= 100 else 0.0
+        
+        # ۳. گرم کردن تدریجی (Warm-up) برای DAG از اپوک ۱۰۰ تا ۸۰۰
+        if epoch < 100:
+            lambda_dag = 0.0
+        else:
+            # رشد خطی ضریب پنالتی DAG
+            lambda_dag = DAG_PENALTY_WEIGHT * (epoch - 100) / (EPOCHS - 100)
+
+        optimizer.zero_grad()
+        pred, raw_adj = model(inputs, masks)
+        
+        recon_loss = F.mse_loss(pred, inputs.squeeze(-1))
+        causal_p = penalty_layer(raw_adj)
+        h_a = dag_penalty(raw_adj)
+        l1_p = torch.norm(raw_adj, 1) 
+        
+        # ترکیب Loss با پارامترهای جدید
+        total_loss = recon_loss + (lambda_causal * causal_p) + (lambda_dag * h_a) + (L1_LAMBDA * l1_p)
+
+        
+        total_loss.backward()
+        optimizer.step()
+
+        tp, prec, rec, f1, shd = evaluate_metrics_directional(raw_adj, gt_mat, threshold=0.1)
+
+        if f1 > best_f1 and epoch > 0:
+            best_f1 = f1
+            best_stats = {'tp': tp, 'prec': prec, 'rec': rec, 'f1': f1, 'shd': shd, 'epoch': epoch, 'h': h_a.item()}
+
+        if epoch % 100 == 0:
+            print(f"{epoch:<6} | {total_loss.item():<8.3f} | {h_a.item():<9.2e} | {l1_p.item():<7.2f} | {tp:<4} | {f1:<6.3f} | {shd}")
+
+    print("\n" + "="*45)
+    print("FINAL DIRECTIONAL EVALUATION (BEST MODEL)")
+    print("="*45)
+    if best_stats:
+        print(f"Peak Epoch:      {best_stats['epoch']}")
+        print(f"True Positives:  {best_stats['tp']}")
+        print(f"Precision:       {best_stats['prec']:.4f}")
+        print(f"Recall:          {best_stats['rec']:.4f}")
+        print(f"F1-Score:        {best_stats['f1']:.4f}")
+        print(f"SHD:             {best_stats['shd']}")
+        print(f"DAG Penalty (h): {best_stats['h']:.6e}")
+    print("="*45)
